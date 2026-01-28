@@ -29,6 +29,7 @@ import type { PeerId } from '@libp2p/interface-peer-id';
 import type { Connection, Stream } from '@libp2p/interface-connection';
 import type { Message } from '@libp2p/interface-pubsub';
 import winston from 'winston';
+import * as crypto from './crypto.js';
 
 // ============================================================================
 // Logging Setup
@@ -96,9 +97,21 @@ export class ValidationError extends P2PError {
   }
 }
 
+export class SignatureVerificationError extends P2PError {
+  constructor(message: string, public readonly did?: string) {
+    super(message);
+    this.name = 'SignatureVerificationError';
+  }
+}
+
 // ============================================================================
 // Type Definitions
 // ============================================================================
+
+/**
+ * DID resolver function type
+ */
+export type DIDResolver = (did: string) => Promise<crypto.DIDDocument | null>;
 
 /**
  * P2P Network Configuration
@@ -133,6 +146,15 @@ export interface P2PConfig {
 
   /** Connection timeout (ms) */
   connectionTimeout?: number;
+
+  /** Enable signature verification (default: true) */
+  enableSignatureVerification?: boolean;
+
+  /** DID document resolver (required if signature verification enabled) */
+  didResolver?: DIDResolver;
+
+  /** Maximum message age for replay protection (ms, default: 5 minutes) */
+  maxMessageAge?: number;
 }
 
 /**
@@ -254,6 +276,11 @@ export class PsiNetP2P {
   private isShuttingDown: boolean = false;
   private activeOperations: Set<Promise<any>> = new Set();
   private shutdownTimeout: number = 30000; // 30 seconds max drain time
+  // Signature verification
+  private didDocumentCache: Map<string, { doc: crypto.DIDDocument; cachedAt: number }> =
+    new Map();
+  private usedNonces: Map<string, Set<string>> = new Map(); // did -> Set<nonce>
+  private nonceCleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(config: P2PConfig = {}) {
     // Default configuration
@@ -271,7 +298,17 @@ export class PsiNetP2P {
       protocolPrefix: config.protocolPrefix || PROTOCOL_PREFIX,
       maxConnections: config.maxConnections || 50,
       connectionTimeout: config.connectionTimeout || 30000,
+      enableSignatureVerification: config.enableSignatureVerification !== false,
+      didResolver: config.didResolver,
+      maxMessageAge: config.maxMessageAge || 5 * 60 * 1000, // 5 minutes
     } as Required<P2PConfig>;
+
+    // Validate configuration
+    if (this.config.enableSignatureVerification && !this.config.didResolver) {
+      logger.warn(
+        'Signature verification enabled but no DID resolver provided - verification will fail'
+      );
+    }
   }
 
   // --------------------------------------------------------------------------
