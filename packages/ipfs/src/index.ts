@@ -15,6 +15,72 @@ import { CID } from 'multiformats/cid';
 import * as json from 'multiformats/codecs/json';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { fromString, toString } from 'uint8arrays';
+import { LRUCache } from 'lru-cache';
+import winston from 'winston';
+
+// ============================================================================
+// Logging Setup
+// ============================================================================
+
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: '@psinet/ipfs' },
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.printf(({ timestamp, level, message, service, ...meta }) => {
+          const metaStr = Object.keys(meta).length > 0 ? ` ${JSON.stringify(meta)}` : '';
+          return `${timestamp} [${service}] [${level}] ${message}${metaStr}`;
+        })
+      ),
+    }),
+  ],
+});
+
+// ============================================================================
+// Custom Error Classes
+// ============================================================================
+
+export class IPFSError extends Error {
+  constructor(message: string, public readonly cause?: Error) {
+    super(message);
+    this.name = 'IPFSError';
+  }
+}
+
+export class UploadError extends IPFSError {
+  constructor(message: string, cause?: Error) {
+    super(message, cause);
+    this.name = 'UploadError';
+  }
+}
+
+export class FetchError extends IPFSError {
+  constructor(message: string, cause?: Error) {
+    super(message, cause);
+    this.name = 'FetchError';
+  }
+}
+
+export class ValidationError extends IPFSError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
+
+export class TimeoutError extends IPFSError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
 
 // ============================================================================
 // Type Definitions
@@ -226,7 +292,7 @@ export interface IPFSClient {
 export class IPFSManager implements IPFSClient {
   private client: IPFSHTTPClient;
   private config: Required<IPFSConfig>;
-  private cache: Map<string, any> = new Map();
+  private cache: LRUCache<string, DIDDocument | EncryptedContextGraph>;
 
   constructor(config: IPFSConfig = {}) {
     // Default configuration
@@ -246,6 +312,109 @@ export class IPFSManager implements IPFSClient {
       timeout: this.config.timeout,
       ...this.config.ipfsOptions,
     });
+
+    // Initialize LRU cache with size limits
+    this.cache = new LRUCache({
+      max: 1000, // Maximum 1000 entries
+      maxSize: 100 * 1024 * 1024, // 100MB total
+      ttl: 1000 * 60 * 60, // 1 hour TTL
+      sizeCalculation: (value) => {
+        // Estimate size of cached value
+        return JSON.stringify(value).length;
+      },
+      dispose: (value, key) => {
+        // Cleanup on eviction (optional)
+        logger.debug('Cache entry evicted', { cid: key });
+      },
+    });
+  }
+
+  // ------------------------------------------------------------------------
+  // Error Handling & Retry Logic
+  // ------------------------------------------------------------------------
+
+  /**
+   * Retry operation with exponential backoff
+   */
+  private async retryOperation<T>(
+    operation: () => Promise<T>,
+    operationName: string,
+    maxRetries: number = 3
+  ): Promise<T> {
+    const backoffMs = [1000, 2000, 4000]; // exponential backoff
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error as Error;
+
+        // Don't retry on validation errors
+        if (error instanceof ValidationError) {
+          throw error;
+        }
+
+        // Log retry attempt
+        logger.warn('Operation failed, retrying', {
+          operation: operationName,
+          attempt: attempt + 1,
+          maxRetries,
+          error: error instanceof Error ? error.message : String(error),
+        });
+
+        // Don't wait after last attempt
+        if (attempt < maxRetries - 1) {
+          await this.sleep(backoffMs[attempt]);
+        }
+      }
+    }
+
+    throw new IPFSError(
+      `${operationName} failed after ${maxRetries} attempts`,
+      lastError
+    );
+  }
+
+  /**
+   * Check if error is retriable
+   */
+  private isRetriableError(error: any): boolean {
+    // Network errors, timeouts are retriable
+    if (error.code === 'ETIMEDOUT' || error.code === 'ECONNREFUSED') {
+      return true;
+    }
+    if (error.name === 'TimeoutError') {
+      return true;
+    }
+    // Validation errors are not retriable
+    return !(error instanceof ValidationError);
+  }
+
+  /**
+   * Sleep helper
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Execute with timeout
+   */
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    operationName: string
+  ): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(
+          () => reject(new TimeoutError(`${operationName} timed out after ${timeoutMs}ms`)),
+          timeoutMs
+        )
+      ),
+    ]);
   }
 
   // ------------------------------------------------------------------------
@@ -254,59 +423,101 @@ export class IPFSManager implements IPFSClient {
 
   async uploadDIDDocument(doc: DIDDocument): Promise<UploadResult> {
     // Validate DID document
-    this.validateDIDDocument(doc);
+    try {
+      this.validateDIDDocument(doc);
+    } catch (error) {
+      throw new ValidationError(`Invalid DID document: ${(error as Error).message}`);
+    }
 
     // Serialize to JSON
     const content = JSON.stringify(doc, null, 2);
     const bytes = fromString(content);
 
-    // Upload to IPFS
-    const result = await this.client.add(bytes, {
-      pin: true,
-      cidVersion: 1,
-    });
+    // Upload to IPFS with retry logic
+    return this.retryOperation(async () => {
+      try {
+        // Upload with timeout
+        const result = await this.withTimeout(
+          this.client.add(bytes, {
+            pin: true,
+            cidVersion: 1,
+          }),
+          this.config.timeout,
+          'IPFS upload'
+        );
 
-    const uploadResult: UploadResult = {
-      cid: result.cid.toString(),
-      size: result.size,
-      timestamp: Date.now(),
-      pinned: true,
-    };
+        const uploadResult: UploadResult = {
+          cid: result.cid.toString(),
+          size: result.size,
+          timestamp: Date.now(),
+          pinned: true,
+        };
 
-    // Pin to pinning service if configured
-    if (this.config.pinningService !== 'local') {
-      await this.pinToService(uploadResult.cid);
-    }
+        // Pin to pinning service if configured
+        if (this.config.pinningService !== 'local') {
+          await this.pinToService(uploadResult.cid).catch((error) => {
+            logger.warn('Pinning service failed, continuing with upload', {
+              cid: uploadResult.cid,
+              service: this.config.pinningService,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            // Don't fail upload if pinning service fails
+          });
+        }
 
-    return uploadResult;
+        return uploadResult;
+      } catch (error) {
+        throw new UploadError('Failed to upload DID document', error as Error);
+      }
+    }, 'Upload DID document');
   }
 
   async uploadContextGraph(graph: EncryptedContextGraph): Promise<UploadResult> {
     // Validate graph structure
-    this.validateContextGraph(graph);
+    try {
+      this.validateContextGraph(graph);
+    } catch (error) {
+      throw new ValidationError(`Invalid context graph: ${(error as Error).message}`);
+    }
 
     // Serialize graph
     const content = this.serializeGraph(graph);
 
-    // Upload to IPFS
-    const result = await this.client.add(content, {
-      pin: true,
-      cidVersion: 1,
-    });
+    // Upload to IPFS with retry logic
+    return this.retryOperation(async () => {
+      try {
+        const result = await this.withTimeout(
+          this.client.add(content, {
+            pin: true,
+            cidVersion: 1,
+          }),
+          this.config.timeout,
+          'IPFS upload'
+        );
 
-    const uploadResult: UploadResult = {
-      cid: result.cid.toString(),
-      size: result.size,
-      timestamp: Date.now(),
-      pinned: true,
-    };
+        const uploadResult: UploadResult = {
+          cid: result.cid.toString(),
+          size: result.size,
+          timestamp: Date.now(),
+          pinned: true,
+        };
 
-    // Pin to pinning service
-    if (this.config.pinningService !== 'local') {
-      await this.pinToService(uploadResult.cid);
-    }
+        // Pin to pinning service
+        if (this.config.pinningService !== 'local') {
+          await this.pinToService(uploadResult.cid).catch((error) => {
+            logger.warn('Pinning service failed, continuing with upload', {
+              cid: uploadResult.cid,
+              service: this.config.pinningService,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
 
-    return uploadResult;
+        return uploadResult;
+      } catch (error) {
+        throw new UploadError('Failed to upload context graph', error as Error);
+      }
+    }, 'Upload context graph');
   }
 
   async uploadContent(content: Uint8Array | string): Promise<UploadResult> {
@@ -535,7 +746,10 @@ export class IPFSManager implements IPFSClient {
     // This would integrate with Pinata, Web3.Storage, or Infura
     // Implementation depends on the chosen service
     // For now, this is a placeholder
-    console.log(`Pinning ${cid} to ${this.config.pinningService}`);
+    logger.info('Pinning content to service', {
+      cid,
+      service: this.config.pinningService,
+    });
 
     // Example for Pinata:
     // const response = await fetch('https://api.pinata.cloud/pinning/pinByHash', {
@@ -549,7 +763,10 @@ export class IPFSManager implements IPFSClient {
   }
 
   private async unpinFromService(cid: string): Promise<void> {
-    console.log(`Unpinning ${cid} from ${this.config.pinningService}`);
+    logger.info('Unpinning content from service', {
+      cid,
+      service: this.config.pinningService,
+    });
   }
 
   /**

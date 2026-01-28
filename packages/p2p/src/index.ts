@@ -28,6 +28,73 @@ import { fromString, toString } from 'uint8arrays';
 import type { PeerId } from '@libp2p/interface-peer-id';
 import type { Connection, Stream } from '@libp2p/interface-connection';
 import type { Message } from '@libp2p/interface-pubsub';
+import winston from 'winston';
+
+// ============================================================================
+// Logging Setup
+// ============================================================================
+
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: '@psinet/p2p' },
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.printf(({ timestamp, level, message, service, ...meta }) => {
+          const metaStr = Object.keys(meta).length > 0 ? ` ${JSON.stringify(meta)}` : '';
+          return `${timestamp} [${service}] [${level}] ${message}${metaStr}`;
+        })
+      ),
+    }),
+  ],
+});
+
+// ============================================================================
+// Security Constants
+// ============================================================================
+
+const MAX_MESSAGE_SIZE = 1024 * 1024; // 1MB max message size
+const MAX_SYNC_SIZE = 10 * 1024 * 1024; // 10MB max sync size
+const RATE_LIMIT_WINDOW = 10000; // 10 seconds
+const RATE_LIMIT_MAX_REQUESTS = 100; // 100 requests per window
+
+// ============================================================================
+// Custom Error Classes
+// ============================================================================
+
+export class P2PError extends Error {
+  constructor(message: string, public readonly cause?: Error) {
+    super(message);
+    this.name = 'P2PError';
+  }
+}
+
+export class MessageTooLargeError extends P2PError {
+  constructor(size: number, maxSize: number) {
+    super(`Message size ${size} exceeds maximum ${maxSize}`);
+    this.name = 'MessageTooLargeError';
+  }
+}
+
+export class RateLimitError extends P2PError {
+  constructor(peerId: string) {
+    super(`Rate limit exceeded for peer ${peerId}`);
+    this.name = 'RateLimitError';
+  }
+}
+
+export class ValidationError extends P2PError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
 
 // ============================================================================
 // Type Definitions
@@ -180,6 +247,9 @@ export class PsiNetP2P {
   private syncHandlers: Set<SyncHandler> = new Set();
   private didToPeerMap: Map<string, PeerId> = new Map();
   private peerToDIDMap: Map<string, string> = new Map();
+  // Rate limiting
+  private rateLimitMap: Map<string, { count: number; resetAt: number }> = new Map();
+  private rateLimitCleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(config: P2PConfig = {}) {
     // Default configuration
@@ -283,11 +353,17 @@ export class PsiNetP2P {
     // Start the node
     await this.node.start();
 
-    console.log(`ΨNet P2P node started`);
-    console.log(`Peer ID: ${this.node.peerId.toString()}`);
-    console.log(`Listening on:`);
-    this.node.getMultiaddrs().forEach((addr) => {
-      console.log(`  ${addr.toString()}`);
+    // Start rate limit cleanup (every 60 seconds)
+    this.rateLimitCleanupInterval = setInterval(() => {
+      this.cleanupRateLimits();
+    }, 60000);
+
+    const addresses = this.node.getMultiaddrs().map((addr) => addr.toString());
+    logger.info('ΨNet P2P node started', {
+      peerId: this.node.peerId.toString(),
+      addresses,
+      dhtEnabled: this.config.enableDHT,
+      gossipsubEnabled: this.config.enableGossipsub,
     });
   }
 
@@ -299,14 +375,21 @@ export class PsiNetP2P {
       return;
     }
 
+    // Clear rate limit cleanup interval
+    if (this.rateLimitCleanupInterval) {
+      clearInterval(this.rateLimitCleanupInterval);
+      this.rateLimitCleanupInterval = null;
+    }
+
     await this.node.stop();
     this.node = null;
     this.messageHandlers.clear();
     this.syncHandlers.clear();
     this.didToPeerMap.clear();
     this.peerToDIDMap.clear();
+    this.rateLimitMap.clear();
 
-    console.log('ΨNet P2P node stopped');
+    logger.info('ΨNet P2P node stopped');
   }
 
   /**
@@ -339,50 +422,125 @@ export class PsiNetP2P {
     // Serialize message
     const messageBytes = this.serializeMessage(message);
 
-    // Open stream to peer
-    const stream = await this.node.dialProtocol(peerId, DIRECT_MESSAGE_PROTOCOL);
+    // Validate message size before sending
+    this.validateMessageSize(messageBytes, MAX_MESSAGE_SIZE);
 
-    // Send message
-    await pipe(
-      [messageBytes],
-      lp.encode,
-      stream,
-      lp.decode,
-      async (source) => {
-        // Read response (if any)
-        for await (const msg of source) {
-          console.log('Received response:', msg);
+    // Open stream to peer
+    let stream: Stream | null = null;
+    try {
+      stream = await this.node.dialProtocol(peerId, DIRECT_MESSAGE_PROTOCOL);
+
+      // Send message
+      await pipe(
+        [messageBytes],
+        lp.encode,
+        stream,
+        lp.decode,
+        async (source) => {
+          // Read response (if any)
+          for await (const msg of source) {
+            logger.debug('Received direct message response', {
+              from: peerId.toString(),
+              size: msg.length,
+            });
+          }
+        }
+      );
+    } finally {
+      // Ensure stream is always closed
+      if (stream) {
+        try {
+          stream.close();
+        } catch (error) {
+          logger.warn('Error closing stream', {
+            peerId: peerId.toString(),
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       }
-    );
+    }
   }
 
   /**
    * Handle incoming direct messages
    */
   private async handleDirectMessage({ stream }: { stream: Stream }): Promise<void> {
+    const remotePeer = stream.connection.remotePeer;
+    const peerIdStr = remotePeer.toString();
+
     try {
+      // 1. Check rate limit BEFORE processing
+      if (!this.checkRateLimit(peerIdStr)) {
+        logger.warn('Rate limit exceeded for direct message', { peerId: peerIdStr });
+        stream.close();
+        throw new RateLimitError(peerIdStr);
+      }
+
       await pipe(
         stream,
         lp.decode,
         async (source) => {
           for await (const msg of source) {
-            const message = this.deserializeMessage(msg.subarray());
+            try {
+              // 2. Validate message size BEFORE deserializing
+              this.validateMessageSize(msg.subarray(), MAX_MESSAGE_SIZE);
 
-            // Get sender's peer ID from stream
-            const from = stream.connection.remotePeer;
+              // 3. Deserialize message
+              const message = this.deserializeMessage(msg.subarray());
 
-            // Dispatch to registered handlers
-            for (const [type, handler] of this.messageHandlers) {
-              if (type === message.type || type === '*') {
-                await handler(message, from);
+              // 4. Dispatch to registered handlers
+              for (const [type, handler] of this.messageHandlers) {
+                if (type === message.type || type === '*') {
+                  await handler(message, remotePeer);
+                }
+              }
+            } catch (error) {
+              if (error instanceof MessageTooLargeError) {
+                logger.error('Message too large', {
+                  peerId: peerIdStr,
+                  error: error.message,
+                });
+                stream.close();
+                throw error;
+              } else if (error instanceof ValidationError) {
+                logger.error('Invalid message received', {
+                  peerId: peerIdStr,
+                  error: error.message,
+                });
+                stream.close();
+                throw error;
+              } else {
+                logger.error('Error processing message', {
+                  peerId: peerIdStr,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+                throw error;
               }
             }
           }
         }
       );
     } catch (error) {
-      console.error('Error handling direct message:', error);
+      if (error instanceof RateLimitError) {
+        logger.error('Rate limit exceeded', { peerId: peerIdStr });
+      } else if (error instanceof MessageTooLargeError || error instanceof ValidationError) {
+        logger.error('Security violation detected', {
+          peerId: peerIdStr,
+          violation: error.name,
+          error: error.message,
+        });
+      } else {
+        logger.error('Error handling direct message', {
+          peerId: peerIdStr,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      // Ensure stream is closed on any error
+      try {
+        stream.close();
+      } catch (closeError) {
+        // Ignore close errors
+      }
     }
   }
 
@@ -419,53 +577,130 @@ export class PsiNetP2P {
     // Serialize request
     const requestBytes = this.serializeSyncMessage(syncRequest);
 
+    // Validate message size before sending
+    this.validateMessageSize(requestBytes, MAX_SYNC_SIZE);
+
     // Open stream
     const peerIdObj = await this.parsePeerId(peerId);
-    const stream = await this.node.dialProtocol(peerIdObj, CONTEXT_SYNC_PROTOCOL);
+    let stream: Stream | null = null;
+    try {
+      stream = await this.node.dialProtocol(peerIdObj, CONTEXT_SYNC_PROTOCOL);
 
-    // Send request and receive response
-    await pipe(
-      [requestBytes],
-      lp.encode,
-      stream,
-      lp.decode,
-      async (source) => {
-        for await (const msg of source) {
-          const response = this.deserializeSyncMessage(msg.subarray());
+      // Send request and receive response
+      await pipe(
+        [requestBytes],
+        lp.encode,
+        stream,
+        lp.decode,
+        async (source) => {
+          for await (const msg of source) {
+            // Validate response size
+            this.validateMessageSize(msg.subarray(), MAX_SYNC_SIZE);
 
-          // Process sync response
-          for (const handler of this.syncHandlers) {
-            await handler(response, peerIdObj);
+            const response = this.deserializeSyncMessage(msg.subarray());
+
+            // Process sync response
+            for (const handler of this.syncHandlers) {
+              await handler(response, peerIdObj);
+            }
           }
         }
+      );
+    } finally {
+      // Ensure stream is always closed
+      if (stream) {
+        try {
+          stream.close();
+        } catch (error) {
+          logger.warn('Error closing sync stream', {
+            peerId: peerIdObj.toString(),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
-    );
+    }
   }
 
   /**
    * Handle incoming context sync requests
    */
   private async handleContextSync({ stream }: { stream: Stream }): Promise<void> {
+    const remotePeer = stream.connection.remotePeer;
+    const peerIdStr = remotePeer.toString();
+
     try {
+      // 1. Check rate limit BEFORE processing
+      if (!this.checkRateLimit(peerIdStr)) {
+        logger.warn('Rate limit exceeded for context sync', { peerId: peerIdStr });
+        stream.close();
+        throw new RateLimitError(peerIdStr);
+      }
+
       await pipe(
         stream,
         lp.decode,
         async (source) => {
           for await (const msg of source) {
-            const syncMessage = this.deserializeSyncMessage(msg.subarray());
-            const from = stream.connection.remotePeer;
+            try {
+              // 2. Validate message size (larger limit for sync)
+              this.validateMessageSize(msg.subarray(), MAX_SYNC_SIZE);
 
-            // Dispatch to sync handlers
-            for (const handler of this.syncHandlers) {
-              await handler(syncMessage, from);
+              // 3. Deserialize sync message
+              const syncMessage = this.deserializeSyncMessage(msg.subarray());
+
+              // 4. Dispatch to sync handlers
+              for (const handler of this.syncHandlers) {
+                await handler(syncMessage, remotePeer);
+              }
+
+              // TODO: Send response based on handler results
+            } catch (error) {
+              if (error instanceof MessageTooLargeError) {
+                logger.error('Sync message too large', {
+                  peerId: peerIdStr,
+                  error: error.message,
+                });
+                stream.close();
+                throw error;
+              } else if (error instanceof ValidationError) {
+                logger.error('Invalid sync message received', {
+                  peerId: peerIdStr,
+                  error: error.message,
+                });
+                stream.close();
+                throw error;
+              } else {
+                logger.error('Error processing sync message', {
+                  peerId: peerIdStr,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+                throw error;
+              }
             }
-
-            // TODO: Send response based on handler results
           }
         }
       );
     } catch (error) {
-      console.error('Error handling context sync:', error);
+      if (error instanceof RateLimitError) {
+        logger.error('Rate limit exceeded for sync', { peerId: peerIdStr });
+      } else if (error instanceof MessageTooLargeError || error instanceof ValidationError) {
+        logger.error('Security violation detected on sync', {
+          peerId: peerIdStr,
+          violation: error.name,
+          error: error.message,
+        });
+      } else {
+        logger.error('Error handling context sync', {
+          peerId: peerIdStr,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      // Ensure stream is closed on any error
+      try {
+        stream.close();
+      } catch (closeError) {
+        // Ignore close errors
+      }
     }
   }
 
@@ -657,6 +892,62 @@ export class PsiNetP2P {
     }
 
     return peers;
+  }
+
+  // --------------------------------------------------------------------------
+  // Security Methods
+  // --------------------------------------------------------------------------
+
+  /**
+   * Check rate limit for a peer
+   * @param peerId Peer ID to check
+   * @returns true if within limits, false if rate limited
+   */
+  private checkRateLimit(peerId: string): boolean {
+    const now = Date.now();
+    const record = this.rateLimitMap.get(peerId);
+
+    if (!record || now > record.resetAt) {
+      // New window or expired window
+      this.rateLimitMap.set(peerId, {
+        count: 1,
+        resetAt: now + RATE_LIMIT_WINDOW,
+      });
+      return true;
+    }
+
+    if (record.count >= RATE_LIMIT_MAX_REQUESTS) {
+      // Rate limit exceeded
+      return false;
+    }
+
+    // Increment counter
+    record.count++;
+    return true;
+  }
+
+  /**
+   * Validate message size
+   * @param data Message data
+   * @param maxSize Maximum allowed size
+   * @throws MessageTooLargeError if message exceeds max size
+   */
+  private validateMessageSize(data: Uint8Array, maxSize: number): void {
+    if (data.byteLength > maxSize) {
+      throw new MessageTooLargeError(data.byteLength, maxSize);
+    }
+  }
+
+  /**
+   * Clean up expired rate limit entries (prevents memory leak)
+   */
+  private cleanupRateLimits(): void {
+    const now = Date.now();
+    for (const [peerId, record] of this.rateLimitMap.entries()) {
+      if (now > record.resetAt) {
+        this.rateLimitMap.delete(peerId);
+      }
+    }
   }
 
   // --------------------------------------------------------------------------
