@@ -23,7 +23,8 @@
     "multiformats": "^13.0.0",
     "uint8arrays": "^5.0.0",
     "lru-cache": "^10.0.0",
-    "winston": "^3.11.0"
+    "winston": "^3.11.0",
+    "opossum": "^8.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

@@ -250,6 +250,10 @@ export class PsiNetP2P {
   // Rate limiting
   private rateLimitMap: Map<string, { count: number; resetAt: number }> = new Map();
   private rateLimitCleanupInterval: NodeJS.Timeout | null = null;
+  // Graceful shutdown
+  private isShuttingDown: boolean = false;
+  private activeOperations: Set<Promise<any>> = new Set();
+  private shutdownTimeout: number = 30000; // 30 seconds max drain time
 
   constructor(config: P2PConfig = {}) {
     // Default configuration
@@ -368,28 +372,88 @@ export class PsiNetP2P {
   }
 
   /**
-   * Stop the P2P node
+   * Stop the P2P node with graceful shutdown
    */
   async stop(): Promise<void> {
     if (!this.node) {
       return;
     }
 
-    // Clear rate limit cleanup interval
+    // Step 1: Set shutdown flag to reject new operations
+    this.isShuttingDown = true;
+    logger.info('Graceful shutdown initiated', {
+      activeOperations: this.activeOperations.size,
+      maxDrainTime: this.shutdownTimeout,
+    });
+
+    // Step 2: Wait for active operations to complete (with timeout)
+    const drainStart = Date.now();
+    if (this.activeOperations.size > 0) {
+      logger.info('Waiting for active operations to complete', {
+        count: this.activeOperations.size,
+      });
+
+      try {
+        await Promise.race([
+          Promise.all(Array.from(this.activeOperations)),
+          new Promise((resolve) => setTimeout(resolve, this.shutdownTimeout)),
+        ]);
+
+        const drainDuration = Date.now() - drainStart;
+        if (this.activeOperations.size > 0) {
+          logger.warn('Shutdown timeout - forcing close with active operations', {
+            remaining: this.activeOperations.size,
+            drainDuration,
+          });
+        } else {
+          logger.info('All active operations completed', { drainDuration });
+        }
+      } catch (error) {
+        logger.error('Error during operation drain', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // Step 3: Clear intervals and timers
     if (this.rateLimitCleanupInterval) {
       clearInterval(this.rateLimitCleanupInterval);
       this.rateLimitCleanupInterval = null;
     }
 
-    await this.node.stop();
+    // Step 4: Unsubscribe from all topics
+    if (this.node.services.pubsub) {
+      try {
+        this.node.services.pubsub.unsubscribe(TOPIC_NETWORK_UPDATES);
+        logger.debug('Unsubscribed from network topics');
+      } catch (error) {
+        logger.warn('Error unsubscribing from topics', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // Step 5: Stop libp2p node
+    try {
+      await this.node.stop();
+      logger.info('LibP2P node stopped successfully');
+    } catch (error) {
+      logger.error('Error stopping LibP2P node', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // Step 6: Clear all state
     this.node = null;
     this.messageHandlers.clear();
     this.syncHandlers.clear();
     this.didToPeerMap.clear();
     this.peerToDIDMap.clear();
     this.rateLimitMap.clear();
+    this.activeOperations.clear();
+    this.isShuttingDown = false;
 
-    logger.info('ΨNet P2P node stopped');
+    logger.info('ΨNet P2P node stopped gracefully');
   }
 
   /**
@@ -397,6 +461,28 @@ export class PsiNetP2P {
    */
   isRunning(): boolean {
     return this.node !== null && this.node.status === 'started';
+  }
+
+  // --------------------------------------------------------------------------
+  // Operation Tracking for Graceful Shutdown
+  // --------------------------------------------------------------------------
+
+  /**
+   * Track an async operation for graceful shutdown
+   */
+  private async trackOperation<T>(operation: Promise<T>): Promise<T> {
+    if (this.isShuttingDown) {
+      throw new P2PError('Node is shutting down - rejecting new operations');
+    }
+
+    this.activeOperations.add(operation);
+
+    try {
+      const result = await operation;
+      return result;
+    } finally {
+      this.activeOperations.delete(operation);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -409,6 +495,13 @@ export class PsiNetP2P {
    * @param message Encrypted message
    */
   async sendMessage(recipientDID: string, message: EncryptedMessage): Promise<void> {
+    return this.trackOperation(this._sendMessageInternal(recipientDID, message));
+  }
+
+  private async _sendMessageInternal(
+    recipientDID: string,
+    message: EncryptedMessage
+  ): Promise<void> {
     if (!this.node) {
       throw new Error('Node not started');
     }
@@ -563,6 +656,10 @@ export class PsiNetP2P {
    * @param graphCID Graph CID to sync
    */
   async syncContextGraph(peerId: string, graphCID: string): Promise<void> {
+    return this.trackOperation(this._syncContextGraphInternal(peerId, graphCID));
+  }
+
+  private async _syncContextGraphInternal(peerId: string, graphCID: string): Promise<void> {
     if (!this.node) {
       throw new Error('Node not started');
     }

@@ -17,6 +17,7 @@ import { sha256 } from 'multiformats/hashes/sha2';
 import { fromString, toString } from 'uint8arrays';
 import { LRUCache } from 'lru-cache';
 import winston from 'winston';
+import CircuitBreaker from 'opossum';
 
 // ============================================================================
 // Logging Setup
@@ -293,6 +294,8 @@ export class IPFSManager implements IPFSClient {
   private client: IPFSHTTPClient;
   private config: Required<IPFSConfig>;
   private cache: LRUCache<string, DIDDocument | EncryptedContextGraph>;
+  private uploadBreaker: CircuitBreaker;
+  private fetchBreaker: CircuitBreaker;
 
   constructor(config: IPFSConfig = {}) {
     // Default configuration
@@ -326,6 +329,46 @@ export class IPFSManager implements IPFSClient {
         // Cleanup on eviction (optional)
         logger.debug('Cache entry evicted', { cid: key });
       },
+    });
+
+    // Initialize circuit breakers for resilience
+    this.uploadBreaker = new CircuitBreaker(this.uploadInternal.bind(this), {
+      timeout: 10000, // 10s timeout
+      errorThresholdPercentage: 50, // Open after 50% errors
+      resetTimeout: 30000, // Try again after 30s
+      rollingCountTimeout: 10000, // 10s window
+      rollingCountBuckets: 10,
+      name: 'ipfs-upload',
+    });
+
+    this.fetchBreaker = new CircuitBreaker(this.fetchInternal.bind(this), {
+      timeout: 10000, // 10s timeout
+      errorThresholdPercentage: 50,
+      resetTimeout: 30000,
+      rollingCountTimeout: 10000,
+      rollingCountBuckets: 10,
+      name: 'ipfs-fetch',
+    });
+
+    // Log circuit breaker events
+    this.uploadBreaker.on('open', () => {
+      logger.error('Upload circuit breaker opened - IPFS uploads failing');
+    });
+    this.uploadBreaker.on('halfOpen', () => {
+      logger.warn('Upload circuit breaker half-open - testing IPFS');
+    });
+    this.uploadBreaker.on('close', () => {
+      logger.info('Upload circuit breaker closed - IPFS uploads recovered');
+    });
+
+    this.fetchBreaker.on('open', () => {
+      logger.error('Fetch circuit breaker opened - IPFS fetches failing');
+    });
+    this.fetchBreaker.on('halfOpen', () => {
+      logger.warn('Fetch circuit breaker half-open - testing IPFS');
+    });
+    this.fetchBreaker.on('close', () => {
+      logger.info('Fetch circuit breaker closed - IPFS fetches recovered');
     });
   }
 
@@ -418,21 +461,13 @@ export class IPFSManager implements IPFSClient {
   }
 
   // ------------------------------------------------------------------------
-  // Upload Operations
+  // Circuit Breaker Internal Methods
   // ------------------------------------------------------------------------
 
-  async uploadDIDDocument(doc: DIDDocument): Promise<UploadResult> {
-    // Validate DID document
-    try {
-      this.validateDIDDocument(doc);
-    } catch (error) {
-      throw new ValidationError(`Invalid DID document: ${(error as Error).message}`);
-    }
-
-    // Serialize to JSON
-    const content = JSON.stringify(doc, null, 2);
-    const bytes = fromString(content);
-
+  /**
+   * Internal upload method wrapped by circuit breaker
+   */
+  private async uploadInternal(bytes: Uint8Array): Promise<UploadResult> {
     // Upload to IPFS with retry logic
     return this.retryOperation(async () => {
       try {
@@ -467,9 +502,58 @@ export class IPFSManager implements IPFSClient {
 
         return uploadResult;
       } catch (error) {
-        throw new UploadError('Failed to upload DID document', error as Error);
+        throw new UploadError('Failed to upload content', error as Error);
       }
-    }, 'Upload DID document');
+    }, 'IPFS upload');
+  }
+
+  /**
+   * Internal fetch method wrapped by circuit breaker
+   */
+  private async fetchInternal(cid: string): Promise<Uint8Array> {
+    return this.retryOperation(async () => {
+      try {
+        const chunks: Uint8Array[] = [];
+        for await (const chunk of this.client.cat(cid, {
+          timeout: this.config.timeout,
+        })) {
+          chunks.push(chunk);
+        }
+
+        // Concatenate chunks
+        const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+        const result = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of chunks) {
+          result.set(chunk, offset);
+          offset += chunk.length;
+        }
+
+        return result;
+      } catch (error) {
+        throw new FetchError('Failed to fetch content from IPFS', error as Error);
+      }
+    }, 'IPFS fetch');
+  }
+
+  // ------------------------------------------------------------------------
+  // Upload Operations
+  // ------------------------------------------------------------------------
+
+  async uploadDIDDocument(doc: DIDDocument): Promise<UploadResult> {
+    // Validate DID document
+    try {
+      this.validateDIDDocument(doc);
+    } catch (error) {
+      throw new ValidationError(`Invalid DID document: ${(error as Error).message}`);
+    }
+
+    // Serialize to JSON
+    const content = JSON.stringify(doc, null, 2);
+    const bytes = fromString(content);
+
+    // Upload via circuit breaker
+    return this.uploadBreaker.fire(bytes);
   }
 
   async uploadContextGraph(graph: EncryptedContextGraph): Promise<UploadResult> {
@@ -483,57 +567,15 @@ export class IPFSManager implements IPFSClient {
     // Serialize graph
     const content = this.serializeGraph(graph);
 
-    // Upload to IPFS with retry logic
-    return this.retryOperation(async () => {
-      try {
-        const result = await this.withTimeout(
-          this.client.add(content, {
-            pin: true,
-            cidVersion: 1,
-          }),
-          this.config.timeout,
-          'IPFS upload'
-        );
-
-        const uploadResult: UploadResult = {
-          cid: result.cid.toString(),
-          size: result.size,
-          timestamp: Date.now(),
-          pinned: true,
-        };
-
-        // Pin to pinning service
-        if (this.config.pinningService !== 'local') {
-          await this.pinToService(uploadResult.cid).catch((error) => {
-            logger.warn('Pinning service failed, continuing with upload', {
-              cid: uploadResult.cid,
-              service: this.config.pinningService,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          });
-        }
-
-        return uploadResult;
-      } catch (error) {
-        throw new UploadError('Failed to upload context graph', error as Error);
-      }
-    }, 'Upload context graph');
+    // Upload via circuit breaker
+    return this.uploadBreaker.fire(content);
   }
 
   async uploadContent(content: Uint8Array | string): Promise<UploadResult> {
     const bytes = typeof content === 'string' ? fromString(content) : content;
 
-    const result = await this.client.add(bytes, {
-      pin: true,
-      cidVersion: 1,
-    });
-
-    return {
-      cid: result.cid.toString(),
-      size: result.size,
-      timestamp: Date.now(),
-      pinned: true,
-    };
+    // Upload via circuit breaker
+    return this.uploadBreaker.fire(bytes);
   }
 
   // ------------------------------------------------------------------------
@@ -543,18 +585,19 @@ export class IPFSManager implements IPFSClient {
   async fetchDIDDocument(cid: string): Promise<DIDDocument> {
     // Check cache first
     if (this.config.enableCache && this.cache.has(cid)) {
-      return this.cache.get(cid);
+      const cached = this.cache.get(cid);
+      if (cached && 'id' in cached) {
+        // It's a DID document
+        logger.debug('Cache hit for DID document', { cid });
+        return cached as DIDDocument;
+      }
     }
 
-    // Fetch from IPFS
-    const content = await this.fetchContent(cid);
-    const json = toString(content);
-    const doc = JSON.parse(json) as DIDDocument;
+    // Fetch via circuit breaker
+    const data = await this.fetchBreaker.fire(cid);
+    const doc = JSON.parse(toString(data)) as DIDDocument;
 
-    // Validate fetched document
-    this.validateDIDDocument(doc);
-
-    // Cache if enabled
+    // Cache result
     if (this.config.enableCache) {
       this.cache.set(cid, doc);
     }
@@ -563,19 +606,21 @@ export class IPFSManager implements IPFSClient {
   }
 
   async fetchContextGraph(cid: string): Promise<EncryptedContextGraph> {
-    // Check cache
+    // Check cache first
     if (this.config.enableCache && this.cache.has(cid)) {
-      return this.cache.get(cid);
+      const cached = this.cache.get(cid);
+      if (cached && 'encryptedData' in cached) {
+        // It's a context graph
+        logger.debug('Cache hit for context graph', { cid });
+        return cached as EncryptedContextGraph;
+      }
     }
 
-    // Fetch from IPFS
-    const content = await this.fetchContent(cid);
-    const graph = this.deserializeGraph(content);
+    // Fetch via circuit breaker
+    const data = await this.fetchBreaker.fire(cid);
+    const graph = this.deserializeGraph(data);
 
-    // Validate
-    this.validateContextGraph(graph);
-
-    // Cache
+    // Cache result
     if (this.config.enableCache) {
       this.cache.set(cid, graph);
     }
@@ -584,25 +629,10 @@ export class IPFSManager implements IPFSClient {
   }
 
   async fetchContent(cid: string): Promise<Uint8Array> {
-    const chunks: Uint8Array[] = [];
-
-    for await (const chunk of this.client.cat(cid, {
-      timeout: this.config.timeout,
-    })) {
-      chunks.push(chunk);
-    }
-
-    // Concatenate all chunks
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    return result;
+    // Fetch via circuit breaker (no caching for raw content)
+    return this.fetchBreaker.fire(cid);
   }
+
 
   // ------------------------------------------------------------------------
   // Pinning Operations
