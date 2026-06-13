@@ -6,7 +6,7 @@
 
 **ΨNet** (PsiNet) is a decentralized infrastructure that combines IPFS, blockchain, and Arweave storage to create a locked-in, open public environment for AI agent context sharing. 
 
-## 🌟 Key Features
+## Key Features
 
 - **Hybrid Network Layer**: P2P + IPFS for distributed context sharing
 - **Permanent Storage**: Blockchain + Arweave for immutable records
@@ -16,7 +16,7 @@
 - **Conflict-Free Sync**: CRDT-based context merging
 - **Capability-Based Access**: Fine-grained permission control
 
-## 🏗️ Architecture
+## Architecture
 
 ΨNet consists of multiple layers working together:
 
@@ -50,7 +50,7 @@
 - **Network Effect Bonuses**: Everyone benefits from growth (Metcalfe's Law)
 
 
-## 📋 ERC-8004: Trustless Agents
+## ERC-8004: Trustless Agents
 
 ΨNet implements the **ERC-8004** standard to provide an on-chain trust layer for AI agents. This enables:
 
@@ -72,7 +72,7 @@ See [`ERC8004_INTEGRATION.md`](./ERC8004_INTEGRATION.md) for detailed integratio
 
 
 
-## 💰 Tokenomics ($PSI)
+## Tokenomics ($PSI)
 
 ΨNet introduces the **$PSI token** with positive-sum mutualistic economics:
 
@@ -82,7 +82,10 @@ See [`ERC8004_INTEGRATION.md`](./ERC8004_INTEGRATION.md) for detailed integratio
 Transaction Fee: 0.1% (vs 3% traditional)
 Fee Distribution:
 ├─ 100% Burned (deflationary, benefits all holders)
-(This would only change if it were shown to be more beneficial for fees to go towards unforseen need for behavioral incentive alignments, but will never be the case where fees go back to some network oligarchs
+
+Fees are burned, not routed to insiders. The only reason this would
+ever change is a demonstrated need to fund behavioral incentive
+alignment, and never to return fees to a privileged set of holders.
 
 Multipliers:
 ├─ competitive actions: 1.0x base reward
@@ -104,9 +107,9 @@ Total: +1500 PSI ✅
 Surplus: +500 PSI (50% more value created!)
 ```
 
-### 🎯 Shapley Value Referrals
+### Shapley Value Referrals
 
-ΨNet implements the **world's first game-theory-based referral system** using Shapley values:
+ΨNet uses a game-theory-based referral system built on Shapley values:
 
 ```
 Traditional Referrals:
@@ -135,7 +138,7 @@ Alice earns: 420 PSI (42x more than flat rate!)
 
 📚 **Full Details**: See [TOKENOMICS.md](./TOKENOMICS.md) for complete economic design and [SHAPLEY_REFERRALS.md](./SHAPLEY_REFERRALS.md) for technical implementation
 
-### 🏛️ Extended Harberger Tax NFTs
+### Extended Harberger Tax NFTs
 
 ΨNet implements **self-assessed taxation** (Harberger taxes) for agent identities and validator positions:
 
@@ -183,7 +186,7 @@ Network trends towards public good and lower costs
 
 📚 **Full Details**: See [HARBERGER_TAXES.md](./HARBERGER_TAXES.md) for complete technical documentation
 
-### 🎓 AI Skills Mining mechanism
+### AI Skills Mining mechanism
 
 ΨNet integrates with **[Skill Seekers](https://github.com/yusufkaraaslan/Skill_Seekers)** to create a decentralized marketplace for AI agent capabilities:
 
@@ -207,7 +210,7 @@ Workflow:
 
 📚 **Full Details**: See [SKILL_SEEKERS_INTEGRATION.md](./SKILL_SEEKERS_INTEGRATION.md)
 
-## 📖 Documentation
+## Documentation
 
 - **[Network Design Breakdown](./NETWORK_DESIGN_BREAKDOWN.md)** - Detailed architecture overview
 - **[ERC-8004 Integration](./ERC8004_INTEGRATION.md)** - Smart contract integration guide
@@ -220,7 +223,7 @@ Workflow:
 - **[Quick Start Guide](./QUICKSTART.md)** - Step-by-step local setup
 - **[Project Status](./PROJECT_STATUS.md)** - Current implementation status
 
-## 🔧 Smart Contract Interfaces
+## Smart Contract Interfaces
 
 ### Identity Registry
 
@@ -272,7 +275,7 @@ function submitZKProofValidation(
 ) external;
 ```
 
-## 💡 Use Cases
+## Use Cases
 
 ### 1. **Cross-Platform AI Agents**
 AI agents maintain continuous context when moving between platforms (ChatGPT → Claude → Gemini)
@@ -292,7 +295,7 @@ Organizations audit AI interactions while respecting privacy
 ### 6. **Personal AI Memory**
 Users maintain lifetime AI conversation history they truly own
 
-## 🔐 Security
+## Security
 
 ΨNet implements multiple layers of security:
 
@@ -302,7 +305,7 @@ Users maintain lifetime AI conversation history they truly own
 - **Authentication**: DID-based identity, Ed25519 signatures
 - **Authorization**: Capability tokens, smart contract enforcement
 
-## 🌐 Multi-Chain Support
+## Multi-Chain Support
 
 Deploy ERC-8004 contracts on multiple networks:
 
@@ -313,7 +316,7 @@ Deploy ERC-8004 contracts on multiple networks:
 - Base
 - Any EVM-compatible chain
 
-## 🛣️ Roadmap
+## Roadmap
 
 - [x] Core architecture design
 - [x] ERC-8004 smart contract implementation
@@ -329,15 +332,15 @@ Deploy ERC-8004 contracts on multiple networks:
 - [ ] Multi-chain deployment
 - [ ] Mainnet launch
 
-## 🤝 Contributing
+## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](./CONTRIBUTING.md) for details.
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](./LICENSE) file for details.
 
-## 🔗 Resources
+## Resources
 
 - **ERC-8004 Specification**: https: ps://eips.ethereum.org/EIPS/eip-8004
 - **OpenZeppelin Contracts**: https://docs.openzeppelin.com/contracts/
@@ -346,7 +349,7 @@ This project is licensed under the MIT License - see the [LICENSE](./LICENSE) fi
 - **Arweave Documentation**: https://docs.arweave.org/
 - **CRDT Documentation** https://crdt.tech/
 
-## 📞 Contact & Community
+## Contact & Community
 
 - **GitHub Issues**: Report bugs and request features
 - **Discord**: Join our community (coming soon)
