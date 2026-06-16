@@ -60,11 +60,23 @@ contract PsiToken is ERC20, ERC20Burnable, AccessControl, ReentrancyGuard {
     uint256 public totalRewardsDistributed;
     uint256 public totalBurned;
 
+    // FIX #0.5: Circuit breakers for emergency control
+    bool public emergencyPaused;
+    uint256 public dailyMintLimit = 1_000_000 * 10**18; // 1M PSI/day
+    uint256 public mintedToday;
+    uint256 public lastMintReset;
+
     // Events for transparency
     event RewardDistributed(address indexed recipient, uint256 amount, string reason);
     event FeesCollected(uint256 burned, uint256 toRewards, uint256 toTreasury);
     event CooperativeReward(address indexed agent1, address indexed agent2, uint256 bonus);
     event NetworkEffectBonus(address indexed agent, uint256 bonus, uint256 networkSize);
+
+    // FIX #0.5: Circuit breaker events
+    event EmergencyPause(address indexed admin, string reason);
+    event EmergencyUnpause(address indexed admin);
+    event DailyMintLimitExceeded(uint256 attempted, uint256 limit);
+    event DailyMintLimitUpdated(uint256 oldLimit, uint256 newLimit);
 
     constructor() ERC20("PsiNet Token", "PSI") {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -75,15 +87,75 @@ contract PsiToken is ERC20, ERC20Burnable, AccessControl, ReentrancyGuard {
         // Goes to treasury for initial rewards and liquidity
         _mint(address(this), MAX_SUPPLY / 10);
         treasuryPool = MAX_SUPPLY / 10;
+
+        // FIX #0.5: Initialize mint tracking
+        lastMintReset = block.timestamp;
+    }
+
+    // FIX #0.5: Circuit breaker modifier
+    modifier whenNotPaused() {
+        require(!emergencyPaused, "PsiToken: emergency pause active");
+        _;
+    }
+
+    /**
+     * @dev FIX #0.5: Emergency pause to stop all minting and rewarding
+     * Only callable by admin in case of exploit or attack
+     */
+    function emergencyPause(string calldata reason) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        emergencyPaused = true;
+        emit EmergencyPause(msg.sender, reason);
+    }
+
+    /**
+     * @dev FIX #0.5: Unpause after emergency is resolved
+     */
+    function emergencyUnpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        emergencyPaused = false;
+        emit EmergencyUnpause(msg.sender);
+    }
+
+    /**
+     * @dev FIX #0.5: Update daily mint limit
+     */
+    function setDailyMintLimit(uint256 newLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 oldLimit = dailyMintLimit;
+        dailyMintLimit = newLimit;
+        emit DailyMintLimitUpdated(oldLimit, newLimit);
     }
 
     /**
      * @dev Mint new tokens (capped at MAX_SUPPLY)
      * Only callable by MINTER_ROLE
+     * FIX #0.5: Added daily mint limit check
      */
-    function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) {
+    function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) whenNotPaused {
         require(totalSupply() + amount <= MAX_SUPPLY, "PsiToken: max supply exceeded");
+
+        // FIX #0.5: Check daily mint limit
+        _checkDailyMintLimit(amount);
+
         _mint(to, amount);
+    }
+
+    /**
+     * @dev FIX #0.5: Internal function to check and update daily mint limit
+     */
+    function _checkDailyMintLimit(uint256 amount) private {
+        // Reset counter if a day has passed
+        if (block.timestamp > lastMintReset + 1 days) {
+            mintedToday = 0;
+            lastMintReset = block.timestamp;
+        }
+
+        // Check limit
+        require(mintedToday + amount <= dailyMintLimit, "PsiToken: daily mint limit exceeded");
+        mintedToday += amount;
+
+        if (mintedToday >= dailyMintLimit * 90 / 100) {
+            // Emit warning if approaching limit (90%)
+            emit DailyMintLimitExceeded(mintedToday, dailyMintLimit);
+        }
     }
 
     /**
@@ -160,7 +232,7 @@ contract PsiToken is ERC20, ERC20Burnable, AccessControl, ReentrancyGuard {
         uint256 baseAmount,
         bool isCooperative,
         uint256 networkSize
-    ) external onlyRole(REWARDER_ROLE) nonReentrant {
+    ) external onlyRole(REWARDER_ROLE) nonReentrant whenNotPaused {
         require(agent != address(0), "PsiToken: zero address");
 
         uint256 reward = baseAmount;
@@ -201,6 +273,7 @@ contract PsiToken is ERC20, ERC20Burnable, AccessControl, ReentrancyGuard {
         external
         onlyRole(REWARDER_ROLE)
         nonReentrant
+        whenNotPaused
     {
         require(validator != address(0), "PsiToken: zero address");
         require(validatorRewardPool >= amount, "PsiToken: insufficient validator pool");
@@ -222,6 +295,7 @@ contract PsiToken is ERC20, ERC20Burnable, AccessControl, ReentrancyGuard {
         external
         onlyRole(REWARDER_ROLE)
         nonReentrant
+        whenNotPaused
     {
         require(agent1 != address(0) && agent2 != address(0), "PsiToken: zero address");
 

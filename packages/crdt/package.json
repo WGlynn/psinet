@@ -1,0 +1,33 @@
+{
+  "name": "@psinet/crdt",
+  "version": "0.1.0",
+  "description": "CRDT (Conflict-free Replicated Data Type) support for ΨNet context graphs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "crdt",
+    "psinet",
+    "automerge",
+    "conflict-free",
+    "synchronization"
+  ],
+  "author": "ΨNet Team",
+  "license": "MIT",
+  "dependencies": {
+    "@psinet/context": "^0.1.0",
+    "@automerge/automerge": "^2.1.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/uuid": "^9.0.7",
+    "typescript": "^5.3.0",
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.0"
+  }
+}

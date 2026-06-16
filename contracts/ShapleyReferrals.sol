@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./PsiToken.sol";
 import "./erc8004/IReputationRegistry.sol";
 
@@ -38,6 +38,7 @@ contract ShapleyReferrals is AccessControl, ReentrancyGuard {
     uint256 public constant CHAIN_DEPTH_BONUS = 20 * 10**18; // 20 PSI per depth level
     uint256 public constant COALITION_SIZE_BONUS = 50 * 10**18; // 50 PSI per 3 members
     uint256 public constant MAX_SHAPLEY_DEPTH = 5; // Limit coalition calculation depth for gas efficiency
+    uint256 public constant MAX_COALITION_SIZE_FOR_REWARDS = 10; // Cap coalition size for hyperinflation protection
 
     // Referral tree structure
     struct User {
@@ -85,6 +86,8 @@ contract ShapleyReferrals is AccessControl, ReentrancyGuard {
 
         if (referrer != address(0)) {
             require(users[referrer].exists, "Referrer must be registered");
+            // FIX #0.2: Prevent cycles in referral chain
+            require(!_isInChain(referrer, msg.sender), "Cycle detected in referral chain");
         }
 
         // Calculate chain depth
@@ -224,6 +227,11 @@ contract ShapleyReferrals is AccessControl, ReentrancyGuard {
     function _calculateCoalitionValue(address[] memory coalition) internal view returns (uint256) {
         uint256 size = coalition.length;
 
+        // FIX #0.1: Cap coalition size for value calculation to prevent hyperinflation
+        if (size > MAX_COALITION_SIZE_FOR_REWARDS) {
+            size = MAX_COALITION_SIZE_FOR_REWARDS;
+        }
+
         // Base value: 20 PSI per member
         uint256 baseValue = 20 * 10**18 * size;
 
@@ -236,11 +244,21 @@ contract ShapleyReferrals is AccessControl, ReentrancyGuard {
         // Network effect: Metcalfe's Law (value ∝ n²)
         uint256 networkEffect = (size * size * 10 * 10**18) / 100; // Scaled down
 
+        // FIX #0.1: Cap network effect to prevent quadratic explosion
+        if (networkEffect > 10_000 * 10**18) {
+            networkEffect = 10_000 * 10**18; // Cap at 10k PSI
+        }
+
         // Activity multiplier: engaged users create more value
         uint256 activityMultiplier = _calculateActivityMultiplier(coalition);
 
         uint256 totalValue = baseValue + depthBonus + sizeBonus + networkEffect;
         totalValue = (totalValue * activityMultiplier) / 100;
+
+        // FIX #0.1: Global maximum coalition value cap
+        if (totalValue > 50_000 * 10**18) {
+            totalValue = 50_000 * 10**18; // Cap at 50k PSI total
+        }
 
         return totalValue;
     }
@@ -360,18 +378,61 @@ contract ShapleyReferrals is AccessControl, ReentrancyGuard {
      */
     function getNetworkSize(address user) external view returns (uint256) {
         require(users[user].exists, "User not found");
-        return _countNetwork(user);
+        // FIX #0.3: Use iterative BFS instead of unbounded recursion
+        return _countNetworkIterative(user);
     }
 
-    function _countNetwork(address user) internal view returns (uint256) {
-        uint256 count = 1; // Count self
-        address[] memory referees = users[user].referees;
+    /**
+     * @dev FIX #0.3: Iterative network counting to prevent DoS via deep recursion
+     * Uses BFS with depth and size limits
+     */
+    function _countNetworkIterative(address root) internal view returns (uint256) {
+        uint256 count = 0;
+        uint256 maxDepth = 20; // Reasonable depth limit
+        uint256 maxNodes = 1000; // Maximum nodes to count
 
-        for (uint256 i = 0; i < referees.length; i++) {
-            count += _countNetwork(referees[i]);
+        // Use array as queue for BFS
+        address[] memory queue = new address[](maxNodes);
+        uint256 front = 0;
+        uint256 back = 0;
+
+        queue[back++] = root;
+
+        while (front < back && count < maxNodes) {
+            address current = queue[front++];
+            count++;
+
+            address[] memory referees = users[current].referees;
+
+            // Only traverse up to maxDepth
+            if (users[current].chainDepth < users[root].chainDepth + maxDepth) {
+                for (uint256 i = 0; i < referees.length && back < maxNodes; i++) {
+                    queue[back++] = referees[i];
+                }
+            }
         }
 
         return count;
+    }
+
+    /**
+     * @dev FIX #0.2: Check if descendant is in the chain of ancestor
+     * Prevents cycles in referral graph
+     */
+    function _isInChain(address ancestor, address descendant) internal view returns (bool) {
+        address current = ancestor;
+        uint256 depth = 0;
+        uint256 maxDepth = 100; // Prevent infinite loops
+
+        while (current != address(0) && depth < maxDepth) {
+            if (current == descendant) {
+                return true;
+            }
+            current = users[current].referrer;
+            depth++;
+        }
+
+        return false;
     }
 
     /**

@@ -239,15 +239,30 @@ contract ReputationRegistry is
             // Skip disputed or removed feedback
             if (feedback.disputed || feedback.rating == 0) continue;
 
-            // Calculate time-based weight (more recent = higher weight)
+            // FIX #0.4: Smooth exponential decay instead of cliff
             uint256 age = currentTime - feedback.timestamp;
-            uint256 timeWeight = age > 365 days ? 1 : (365 days - age) / 1 days + 1;
+            uint256 timeWeight;
 
-            // Calculate stake-based weight
-            uint256 stakeWeight = feedback.stake > 0 ? 2 : 1;
+            if (age <= 30 days) {
+                timeWeight = 1000; // Very recent: 10x weight
+            } else if (age <= 90 days) {
+                timeWeight = 500; // Recent: 5x weight
+            } else if (age <= 180 days) {
+                timeWeight = 200; // Medium: 2x weight
+            } else if (age <= 365 days) {
+                timeWeight = 100; // Old: 1x weight
+            } else {
+                // Exponential decay after 1 year
+                uint256 yearsOld = (age - 365 days) / 365 days;
+                timeWeight = 100 / (2 ** yearsOld); // Halve every year
+                if (timeWeight < 10) timeWeight = 10; // Minimum 0.1x
+            }
 
-            // Total weight for this feedback
-            uint256 weight = timeWeight * stakeWeight;
+            // FIX #0.4: Cap stake weight to prevent dominance (was 2x, now 1.5x max)
+            uint256 stakeWeight = feedback.stake > 0 ? 150 : 100;
+
+            // Total weight for this feedback (normalize to base 100)
+            uint256 weight = (timeWeight * stakeWeight) / 100;
 
             // Calculate score based on feedback type
             uint256 score;
